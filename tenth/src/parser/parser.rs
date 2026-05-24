@@ -556,6 +556,31 @@ impl Parser {
                     span,
                 })
             }
+            TokenKind::Star => {
+                self.advance();
+                let expr = self.parse_unary()?;
+                Ok(Expr {
+                    kind: ExprKind::Deref(Box::new(expr)),
+                    span,
+                })
+            }
+            TokenKind::Ampersand => {
+                self.advance();
+                if matches!(self.peek_kind(), TokenKind::Mut) {
+                    self.advance();
+                    let expr = self.parse_unary()?;
+                    Ok(Expr {
+                        kind: ExprKind::MutRef(Box::new(expr)),
+                        span,
+                    })
+                } else {
+                    let expr = self.parse_unary()?;
+                    Ok(Expr {
+                        kind: ExprKind::Ref(Box::new(expr)),
+                        span,
+                    })
+                }
+            }
             _ => self.parse_postfix(),
         }
     }
@@ -883,8 +908,10 @@ impl Parser {
                     None
                 };
 
+                let mut moved = false;
                 let init = if matches!(self.peek_kind(), TokenKind::Assign) {
                     self.advance();
+                    moved = self.match_token(TokenKind::Move);
                     Some(self.parse_expr()?)
                 } else {
                     None
@@ -897,6 +924,7 @@ impl Parser {
                         name,
                         type_ann,
                         mutable,
+                        moved,
                         init,
                     },
                     span,

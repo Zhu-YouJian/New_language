@@ -91,6 +91,13 @@ pub enum HirExprKind {
         scrutinee: Box<HirExpr>,
         arms: Vec<HirMatchArm>,
     },
+    Ref(Box<HirExpr>),
+    MutRef(Box<HirExpr>),
+    Deref(Box<HirExpr>),
+    DerefAssign {
+        target: Box<HirExpr>,
+        value: Box<HirExpr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -153,6 +160,7 @@ pub enum HirStmtKind {
         name: String,
         type_ann: Option<Type>,
         mutable: bool,
+        moved: bool,
         init: Option<HirExpr>,
     },
     Expr(HirExpr),

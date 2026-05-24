@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::cell::RefCell;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use crate::error::TenthResult;
@@ -26,7 +28,7 @@ pub fn run_repl() -> TenthResult<()> {
         trait_defs: HashMap::new(),
         trait_impls: HashMap::new(),
     };
-    let mut variables: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut variables: std::collections::HashMap<String, Rc<RefCell<Value>>> = std::collections::HashMap::new();
 
     loop {
         let prompt = "tenth> ";
@@ -58,7 +60,7 @@ pub fn run_repl() -> TenthResult<()> {
                 }
                 if trimmed == ":vars" {
                     for (name, val) in &variables {
-                        println!("  {} = {}", name, val);
+                        println!("  {} = {}", name, val.borrow());
                     }
                     continue;
                 }
@@ -99,7 +101,7 @@ pub fn run_repl() -> TenthResult<()> {
 fn execute_line(
     line: &str,
     accumulated_program: &mut crate::hir::hir::HirProgram,
-    variables: &mut std::collections::HashMap<String, Value>,
+    variables: &mut std::collections::HashMap<String, Rc<RefCell<Value>>>,
 ) -> TenthResult<Option<Value>> {
     let mut lexer = Lexer::new(line);
     let tokens = lexer.tokenize()?;

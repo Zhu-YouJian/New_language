@@ -5,9 +5,18 @@ use crate::parser::ast as ast;
 use super::hir::*;
 use super::types::*;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OwnershipStatus {
+    Owned,
+    SharedRef(usize),
+    ExclusiveRef,
+    Moved,
+}
+
 struct Scope {
     variables: HashMap<String, (Type, bool)>,
     functions: HashMap<String, (Vec<(String, Type)>, Type)>,
+    ownership: HashMap<String, OwnershipStatus>,
     parent: Option<Box<Scope>>,
 }
 
@@ -16,6 +25,7 @@ impl Scope {
         Scope {
             variables: HashMap::new(),
             functions: HashMap::new(),
+            ownership: HashMap::new(),
             parent: None,
         }
     }
@@ -24,6 +34,7 @@ impl Scope {
         Scope {
             variables: HashMap::new(),
             functions: HashMap::new(),
+            ownership: HashMap::new(),
             parent: Some(Box::new(parent)),
         }
     }
@@ -35,8 +46,22 @@ impl Scope {
         self.parent.as_ref().and_then(|p| p.lookup_var(name))
     }
 
+    fn lookup_ownership(&self, name: &str) -> OwnershipStatus {
+        if let Some(status) = self.ownership.get(name) {
+            return *status;
+        }
+        self.parent.as_ref()
+            .map(|p| p.lookup_ownership(name))
+            .unwrap_or(OwnershipStatus::Owned)
+    }
+
+    fn set_ownership(&mut self, name: &str, status: OwnershipStatus) {
+        self.ownership.insert(name.to_string(), status);
+    }
+
     fn define_var(&mut self, name: String, ty: Type, mutable: bool) {
-        self.variables.insert(name, (ty, mutable));
+        self.variables.insert(name.clone(), (ty, mutable));
+        self.ownership.insert(name, OwnershipStatus::Owned);
     }
 
     fn define_fn(&mut self, name: String, params: Vec<(String, Type)>, ret: Type) {
@@ -48,6 +73,92 @@ impl Scope {
             return Some(f.clone());
         }
         self.parent.as_ref().and_then(|p| p.lookup_fn(name))
+    }
+
+    fn check_read(&self, name: &str, span: &Span) -> TenthResult<()> {
+        match self.lookup_ownership(name) {
+            OwnershipStatus::Moved => Err(TenthError::TypeError {
+                line: span.line,
+                col: span.col,
+                message: format!("variable '{}' has been moved", name),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    fn borrow_shared(&mut self, name: &str, span: &Span) -> TenthResult<()> {
+        match self.lookup_ownership(name) {
+            OwnershipStatus::ExclusiveRef => Err(TenthError::TypeError {
+                line: span.line,
+                col: span.col,
+                message: format!("cannot borrow '{}' as shared while it is mutably borrowed", name),
+            }),
+            OwnershipStatus::Moved => Err(TenthError::TypeError {
+                line: span.line,
+                col: span.col,
+                message: format!("cannot borrow '{}' as shared after move", name),
+            }),
+            OwnershipStatus::SharedRef(n) => {
+                self.set_ownership(name, OwnershipStatus::SharedRef(n + 1));
+                Ok(())
+            }
+            OwnershipStatus::Owned => {
+                self.set_ownership(name, OwnershipStatus::SharedRef(1));
+                Ok(())
+            }
+        }
+    }
+
+    fn borrow_exclusive(&mut self, name: &str, span: &Span) -> TenthResult<()> {
+        match self.lookup_ownership(name) {
+            OwnershipStatus::SharedRef(n) if n > 0 => Err(TenthError::TypeError {
+                line: span.line,
+                col: span.col,
+                message: format!("cannot borrow '{}' as mutable while it is shared borrowed", name),
+            }),
+            OwnershipStatus::ExclusiveRef => Err(TenthError::TypeError {
+                line: span.line,
+                col: span.col,
+                message: format!("cannot borrow '{}' as mutable twice", name),
+            }),
+            OwnershipStatus::Moved => Err(TenthError::TypeError {
+                line: span.line,
+                col: span.col,
+                message: format!("cannot borrow '{}' as mutable after move", name),
+            }),
+            OwnershipStatus::Owned => {
+                self.set_ownership(name, OwnershipStatus::ExclusiveRef);
+                Ok(())
+            }
+            OwnershipStatus::SharedRef(_) => {
+                self.set_ownership(name, OwnershipStatus::ExclusiveRef);
+                Ok(())
+            }
+        }
+    }
+
+    fn mark_moved(&mut self, name: &str, span: &Span) -> TenthResult<()> {
+        match self.lookup_ownership(name) {
+            OwnershipStatus::SharedRef(n) if n > 0 => Err(TenthError::TypeError {
+                line: span.line,
+                col: span.col,
+                message: format!("cannot move '{}' while it is shared borrowed", name),
+            }),
+            OwnershipStatus::ExclusiveRef => Err(TenthError::TypeError {
+                line: span.line,
+                col: span.col,
+                message: format!("cannot move '{}' while it is mutably borrowed", name),
+            }),
+            OwnershipStatus::Moved => Err(TenthError::TypeError {
+                line: span.line,
+                col: span.col,
+                message: format!("variable '{}' has already been moved", name),
+            }),
+            OwnershipStatus::SharedRef(_) | OwnershipStatus::Owned => {
+                self.set_ownership(name, OwnershipStatus::Moved);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -169,6 +280,7 @@ impl Lowerer {
                                 ret: Box::new(f.1),
                             })
                         }).unwrap_or(Type::Unknown);
+                        self.scope.check_read(&ident.name, &span)?;
                         (HirExprKind::Var(ident.name.clone()), ty)
                     }
                 }
@@ -362,21 +474,25 @@ impl Lowerer {
             }
 
             ExprKind::Assign { target, value } => {
-                let v = self.lower_expr(value)?;
-                let name = match &target.kind {
-                    ExprKind::Ident(id) => id.name.clone(),
-                    _ => {
-                        // allow shadowing for simplicity
-                        return Err(TenthError::ParseError {
-                            line: span.line,
-                            col: span.col,
-                            message: "invalid assignment target".into(),
-                        });
-                    }
-                };
-                // define/update variable
-                self.scope.define_var(name.clone(), v.ty.clone(), true);
-                (HirExprKind::Assign { target: name, value: Box::new(v) }, Type::unit())
+                if let ExprKind::Deref(inner) = &target.kind {
+                    let lowered_target = self.lower_expr(inner)?;
+                    let lowered_value = self.lower_expr(value)?;
+                    (HirExprKind::DerefAssign { target: Box::new(lowered_target), value: Box::new(lowered_value) }, Type::unit())
+                } else {
+                    let v = self.lower_expr(value)?;
+                    let name = match &target.kind {
+                        ExprKind::Ident(id) => id.name.clone(),
+                        _ => {
+                            return Err(TenthError::ParseError {
+                                line: span.line,
+                                col: span.col,
+                                message: "invalid assignment target".into(),
+                            });
+                        }
+                    };
+                    self.scope.define_var(name.clone(), v.ty.clone(), true);
+                    (HirExprKind::Assign { target: name, value: Box::new(v) }, Type::unit())
+                }
             }
 
             ExprKind::AssignOp { target, op, value } => {
@@ -447,6 +563,33 @@ impl Lowerer {
                     scrutinee: Box::new(lowered_scrutinee),
                     arms: lowered_arms,
                 }, Type::Unknown)
+            }
+
+            ExprKind::Ref(inner) => {
+                if let ExprKind::Ident(id) = &inner.kind {
+                    self.scope.borrow_shared(&id.name, &span)?;
+                }
+                let e = self.lower_expr(inner)?;
+                let inner_ty = e.ty.clone();
+                (HirExprKind::Ref(Box::new(e)), Type::Ref(Box::new(inner_ty)))
+            }
+
+            ExprKind::MutRef(inner) => {
+                if let ExprKind::Ident(id) = &inner.kind {
+                    self.scope.borrow_exclusive(&id.name, &span)?;
+                }
+                let e = self.lower_expr(inner)?;
+                let inner_ty = e.ty.clone();
+                (HirExprKind::MutRef(Box::new(e)), Type::MutRef(Box::new(inner_ty)))
+            }
+
+            ExprKind::Deref(inner) => {
+                let e = self.lower_expr(inner)?;
+                let deref_ty = match &e.ty {
+                    Type::Ref(inner) | Type::MutRef(inner) => (**inner).clone(),
+                    _ => Type::Unknown,
+                };
+                (HirExprKind::Deref(Box::new(e)), deref_ty)
             }
         };
 
@@ -581,7 +724,7 @@ impl Lowerer {
         let span = stmt.span.clone();
 
         let kind = match &stmt.kind {
-            StmtKind::Let { name, type_ann, mutable, init } => {
+            StmtKind::Let { name, type_ann, mutable, moved, init } => {
                 let lowered_init = init.as_ref().map(|i| self.lower_expr(i)).transpose()?;
                 let ty = type_ann.as_ref()
                     .map(|a| Type::from_annotation(a))
@@ -590,10 +733,17 @@ impl Lowerer {
 
                 self.scope.define_var(name.name.clone(), ty.clone(), *mutable);
 
+                if *moved {
+                    if let Some(ast::Expr { kind: ast::ExprKind::Ident(source), .. }) = init {
+                        self.scope.mark_moved(&source.name, &span)?;
+                    }
+                }
+
                 HirStmtKind::Let {
                     name: name.name.clone(),
                     type_ann: type_ann.as_ref().map(|a| Type::from_annotation(a)),
                     mutable: *mutable,
+                    moved: *moved,
                     init: lowered_init,
                 }
             }

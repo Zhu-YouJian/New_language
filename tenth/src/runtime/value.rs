@@ -32,6 +32,8 @@ pub enum Value {
         variant: String,
         fields: Vec<(String, Value)>,
     },
+    Ref(Rc<RefCell<Value>>),
+    MutRef(Rc<RefCell<Value>>),
 }
 
 impl Value {
@@ -62,6 +64,8 @@ impl Value {
             }
             Value::Struct { name, .. } => Type::Struct(name.clone()),
             Value::Enum { enum_name, .. } => Type::Enum(enum_name.clone()),
+            Value::Ref(v) => Type::Ref(Box::new(v.borrow().type_of())),
+            Value::MutRef(v) => Type::MutRef(Box::new(v.borrow().type_of())),
         }
     }
 
@@ -131,6 +135,8 @@ impl fmt::Display for Value {
                     write!(f, ")")
                 }
             }
+            Value::Ref(v) => write!(f, "&{}", v.borrow()),
+            Value::MutRef(v) => write!(f, "&mut {}", v.borrow()),
         }
     }
 }

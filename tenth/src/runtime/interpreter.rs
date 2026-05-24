@@ -8,7 +8,7 @@ use super::value::Value;
 use super::tensor::Tensor;
 
 pub struct Interpreter {
-    pub variables: HashMap<String, Value>,
+    pub variables: HashMap<String, Rc<RefCell<Value>>>,
     functions: Vec<HirFnDef>,
     generic_funcs: HashMap<String, HirFnDef>,
     generic_structs: HashMap<String, HirGenericStruct>,
@@ -30,8 +30,31 @@ impl Interpreter {
         }
     }
 
+    fn var_ref(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
+        self.variables.get(name).cloned()
+    }
+
+    fn var_get(&self, name: &str) -> Option<Value> {
+        self.variables.get(name).map(|rc| rc.borrow().clone())
+    }
+
+    fn var_set(&mut self, name: String, val: Value) {
+        self.variables.insert(name, Rc::new(RefCell::new(val)));
+    }
+
+    fn var_set_rc(&mut self, name: String, rc: Rc<RefCell<Value>>) {
+        self.variables.insert(name, rc);
+    }
+
+    fn resolve_var_name(&self, expr: &HirExpr) -> Option<String> {
+        match &expr.kind {
+            HirExprKind::Var(name) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
     pub fn execute_program(&mut self, program: &HirProgram) -> TenthResult<Option<Value>> {
-        self.variables.insert(
+        self.var_set(
             "tensor".to_string(),
             Value::FnRef {
                 name: "tensor".to_string(),
@@ -46,7 +69,7 @@ impl Interpreter {
         for func in &program.functions {
             let params = func.params.clone();
             let ret = func.return_type.clone();
-            self.variables.insert(
+            self.var_set(
                 func.name.clone(),
                 Value::FnRef {
                     name: func.name.clone(),
@@ -67,7 +90,7 @@ impl Interpreter {
                 if let Some(module) = self.modules.get(mod_name) {
                     if let Some(fn_def) = module.functions.iter().find(|f| &f.name == fn_name) {
                         self.functions.push(fn_def.clone());
-                        self.variables.insert(
+                        self.var_set(
                             alias.clone(),
                             Value::FnRef {
                                 name: alias.clone(),
@@ -125,8 +148,7 @@ impl Interpreter {
                         return_type: Type::Unknown,
                     }));
                 }
-                self.variables.get(name)
-                    .cloned()
+                self.var_get(name)
                     .or_else(|| {
                         match name.as_str() {
                             "println" | "eprintln" | "tensor" | "rand" | "randn" => {
@@ -206,17 +228,17 @@ impl Interpreter {
                 }
 
                 let saved: HashMap<String, Value> = template.params.iter()
-                    .filter_map(|(n, _)| self.variables.get(n).cloned().map(|v| (n.clone(), v)))
+                    .filter_map(|(n, _)| self.var_get(n).map(|v| (n.clone(), v)))
                     .collect();
 
                 for ((pname, _), arg) in template.params.iter().zip(arg_values.iter()) {
-                    self.variables.insert(pname.clone(), arg.clone());
+                    self.var_set(pname.clone(), arg.clone());
                 }
 
                 let result = self.eval_expr(&template.body);
 
                 for (n, v) in saved {
-                    self.variables.insert(n, v);
+                    self.var_set(n, v);
                 }
 
                 result
@@ -332,12 +354,12 @@ impl Interpreter {
                 let v = self.eval_expr(value)?.ok_or_else(|| TenthError::RuntimeError {
                     message: "assign value is void".into(),
                 })?;
-                self.variables.insert(target.clone(), v);
+                self.var_set(target.clone(), v);
                 Ok(Some(Value::Unit))
             }
 
             HirExprKind::AssignOp { target, op, value } => {
-                let current = self.variables.get(target).cloned().ok_or_else(|| {
+                let current = self.var_get(target).ok_or_else(|| {
                     TenthError::RuntimeError {
                         message: format!("undefined variable '{}'", target),
                     }
@@ -346,7 +368,7 @@ impl Interpreter {
                     message: "assign-op value is void".into(),
                 })?;
                 let result = self.eval_binary(op, &current, &rhs)?;
-                self.variables.insert(target.clone(), result);
+                self.var_set(target.clone(), result);
                 Ok(Some(Value::Unit))
             }
 
@@ -397,7 +419,7 @@ impl Interpreter {
                             if let Some((_fname, bname)) = field_bind {
                                 if let Value::Enum { fields, .. } = &val {
                                     if let Some((_, v)) = fields.first() {
-                                        self.variables.insert(bname.clone(), v.clone());
+                                        self.var_set(bname.clone(), v.clone());
                                     }
                                 }
                             }
@@ -412,6 +434,62 @@ impl Interpreter {
                     }
                 }
                 Ok(Some(Value::Unit))
+            }
+
+            HirExprKind::Ref(inner) => {
+                let var_name = self.resolve_var_name(inner);
+                if let Some(ref name) = var_name {
+                    if let Some(rc) = self.var_ref(name) {
+                        return Ok(Some(Value::Ref(rc)));
+                    }
+                }
+                let val = self.eval_expr(inner)?.ok_or_else(|| TenthError::RuntimeError {
+                    message: "ref operand is void".into(),
+                })?;
+                Ok(Some(Value::Ref(Rc::new(RefCell::new(val)))))
+            }
+
+            HirExprKind::MutRef(inner) => {
+                let var_name = self.resolve_var_name(inner);
+                if let Some(ref name) = var_name {
+                    if let Some(rc) = self.var_ref(name) {
+                        return Ok(Some(Value::MutRef(rc)));
+                    }
+                }
+                let val = self.eval_expr(inner)?.ok_or_else(|| TenthError::RuntimeError {
+                    message: "mut ref operand is void".into(),
+                })?;
+                Ok(Some(Value::MutRef(Rc::new(RefCell::new(val)))))
+            }
+
+            HirExprKind::Deref(inner) => {
+                let val = self.eval_expr(inner)?.ok_or_else(|| TenthError::RuntimeError {
+                    message: "deref operand is void".into(),
+                })?;
+                match &val {
+                    Value::Ref(rc) | Value::MutRef(rc) => Ok(Some(rc.borrow().clone())),
+                    _ => Err(TenthError::RuntimeError {
+                        message: "cannot dereference a non-reference value".into(),
+                    }),
+                }
+            }
+
+            HirExprKind::DerefAssign { target, value } => {
+                let t = self.eval_expr(target)?.ok_or_else(|| TenthError::RuntimeError {
+                    message: "deref-assign target is void".into(),
+                })?;
+                let v = self.eval_expr(value)?.ok_or_else(|| TenthError::RuntimeError {
+                    message: "deref-assign value is void".into(),
+                })?;
+                match &t {
+                    Value::MutRef(rc) => {
+                        *rc.borrow_mut() = v;
+                        Ok(Some(Value::Unit))
+                    }
+                    _ => Err(TenthError::RuntimeError {
+                        message: "can only assign through mutable reference".into(),
+                    }),
+                }
             }
         }
     }
@@ -632,25 +710,25 @@ impl Interpreter {
 
     fn call_method_impl(&mut self, receiver: &Value, method_fn: &HirFnDef, args: &[Value]) -> TenthResult<Option<Value>> {
         let saved: HashMap<String, Value> = method_fn.params.iter()
-            .filter_map(|(n, _)| self.variables.get(n).cloned().map(|v| (n.clone(), v)))
+            .filter_map(|(n, _)| self.var_get(n).map(|v| (n.clone(), v)))
             .collect();
 
-        let self_saved = self.variables.get("self").cloned();
+        let self_saved = self.var_get("self");
 
-        self.variables.insert("self".to_string(), receiver.clone());
+        self.var_set("self".to_string(), receiver.clone());
 
         for ((pname, _), arg) in method_fn.params.iter().skip(1).zip(args.iter()) {
-            self.variables.insert(pname.clone(), arg.clone());
+            self.var_set(pname.clone(), arg.clone());
         }
 
         let result = self.eval_expr(&method_fn.body);
 
         for (n, v) in saved {
-            self.variables.insert(n, v);
+            self.var_set(n, v);
         }
 
         if let Some(v) = self_saved {
-            self.variables.insert("self".to_string(), v);
+            self.var_set("self".to_string(), v);
         } else {
             self.variables.remove("self");
         }
@@ -791,21 +869,21 @@ impl Interpreter {
             }
             Value::Closure { params, body, captures } => {
                 let saved: HashMap<String, Value> = params.iter()
-                    .filter_map(|(n, _)| self.variables.get(n).cloned().map(|v| (n.clone(), v)))
+                    .filter_map(|(n, _)| self.var_get(n).map(|v| (n.clone(), v)))
                     .collect();
 
                 for ((pname, _), arg) in params.iter().zip(args.iter()) {
-                    self.variables.insert(pname.clone(), arg.clone());
+                    self.var_set(pname.clone(), arg.clone());
                 }
 
                 for (cap_name, cap_val) in captures {
-                    self.variables.insert(cap_name.clone(), cap_val.clone());
+                    self.var_set(cap_name.clone(), cap_val.clone());
                 }
 
                 let result = self.eval_expr(body);
 
                 for (n, v) in saved {
-                    self.variables.insert(n, v);
+                    self.var_set(n, v);
                 }
 
                 result
@@ -859,17 +937,17 @@ impl Interpreter {
                     if let Some(fn_def) = module.functions.iter().find(|f| f.name == fn_name) {
                         let fn_def = fn_def.clone();
                         let saved: HashMap<String, Value> = fn_def.params.iter()
-                            .filter_map(|(n, _)| self.variables.get(n).cloned().map(|v| (n.clone(), v)))
+                            .filter_map(|(n, _)| self.var_get(n).map(|v| (n.clone(), v)))
                             .collect();
 
                         for ((pname, _), arg) in fn_def.params.iter().zip(args.iter()) {
-                            self.variables.insert(pname.clone(), arg.clone());
+                            self.var_set(pname.clone(), arg.clone());
                         }
 
                         let result = self.eval_expr(&fn_def.body);
 
                         for (n, v) in saved {
-                            self.variables.insert(n, v);
+                            self.var_set(n, v);
                         }
 
                         return result;
@@ -884,17 +962,17 @@ impl Interpreter {
         let func_def = self.functions.iter().find(|f| f.name == name).cloned();
         if let Some(fd) = func_def {
             let saved: HashMap<String, Value> = fd.params.iter()
-                .filter_map(|(n, _)| self.variables.get(n).cloned().map(|v| (n.clone(), v)))
+                .filter_map(|(n, _)| self.var_get(n).map(|v| (n.clone(), v)))
                 .collect();
 
             for ((pname, _), arg) in fd.params.iter().zip(args.iter()) {
-                self.variables.insert(pname.clone(), arg.clone());
+                self.var_set(pname.clone(), arg.clone());
             }
 
             let result = self.eval_expr(&fd.body);
 
             for (n, v) in saved {
-                self.variables.insert(n, v);
+                self.var_set(n, v);
             }
 
             return result;
@@ -911,12 +989,26 @@ impl Interpreter {
                 self.eval_expr(e)?;
                 Ok(())
             }
-            HirStmtKind::Let { name, init, .. } => {
+            HirStmtKind::Let { name, init, moved, .. } => {
+                let source_var = if *moved {
+                    init.as_ref().and_then(|e| match &e.kind {
+                        HirExprKind::Var(v) => Some(v.clone()),
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
+
                 let val = match init {
                     Some(e) => self.eval_expr(e)?.unwrap_or(Value::Unit),
                     None => Value::Unit,
                 };
-                self.variables.insert(name.clone(), val);
+                self.var_set(name.clone(), val);
+
+                if let Some(src) = source_var {
+                    self.variables.remove(&src);
+                }
+
                 Ok(())
             }
             HirStmtKind::Return(_) => Ok(()),
@@ -947,7 +1039,7 @@ impl Interpreter {
                                 Some(v) => Value::Float(v),
                                 None => Value::Unit,
                             };
-                            self.variables.insert(var.clone(), val);
+                            self.var_set(var.clone(), val);
                             self.eval_stmt(body)?;
                         }
                     }

@@ -123,6 +123,9 @@ pub enum ExprKind {
         scrutinee: Box<Expr>,
         arms: Vec<MatchArm>,
     },
+    Ref(Box<Expr>),
+    MutRef(Box<Expr>),
+    Deref(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -164,6 +167,7 @@ pub enum StmtKind {
         name: Ident,
         type_ann: Option<TypeAnnotation>,
         mutable: bool,
+        moved: bool,
         init: Option<Expr>,
     },
     Expr(Expr),
